@@ -3,6 +3,7 @@
 # -Start - Exec - cmd
 #    > cd C:\Users\USERNAME\AppData\Local\Programs\Python\Python35\Scripts
 #    > easy_install.exe requests
+#    > easy_install.exe python-dateutil
 
 
 import tkinter as tk # Python 3
@@ -10,91 +11,14 @@ from tkinter.filedialog import askopenfilename
 from tkinter import * # Python 3
 import os
 from xml.dom import minidom
-import calendar, datetime, re, time
+import datetime, dateutil.parser, dateutil.tz
 import requests
 
 KDM_FOLDER = ""
 JSON_URL = ""
 SERIAL = ""
 
-_date_date_re = re.compile(r'([\d-]+)T?')
-_date_time_re = re.compile(r'(?:T| )([\d:]+)')
-def parse_date(datetime_str, default_to_local_time = True, get_timestamp = False):
-    """
-    Parses a string for a date and time, assuming
-    that the date is of the format 'YYYY-MM-DD' and the time is of the format 'HH:MM:SS'
-    and handles +/-HH:MM offsets according to RFC3339.
-    Returns the datetime as a posix timestamp or None if it fails to parse
-    """
-    date_search = _date_date_re.search(datetime_str)
-    if date_search:
-        if date_search.group(1).find('-') != -1:
-            date_time_array = [int(i) for i in date_search.group(1).split('-')]
-        else:
-            date_time_array = [
-                int(date_search.group(1)[0:4]),
-                int(date_search.group(1)[4:6]),
-                int(date_search.group(1)[6:8])
-            ]
-        datetime_str = datetime_str[date_search.end(1):]
-
-        # -- Search for the time component (which is optional)
-        time_search = _date_time_re.search(datetime_str)
-        if time_search:
-            if time_search.group(1).find(':') != -1:
-                time_array = [int(i) for i in time_search.group(1).split(':')]
-            else:
-                time_array = [
-                    int(time_search.group(1)[i] + time_search.group(1)[i+1])
-                    for i in range(0, len(time_search.group(1)), 2)
-                ]
-            # -- Pad out any missing time components with zeroes
-            for i in range(3 - len(time_array)):
-                time_array.append(0)
-            date_time_array.extend(time_array)
-            datetime_str = datetime_str[time_search.end():]
-        else:
-            #Missing time so fill it with zeros
-            date_time_array += [0,0,0]
-
-        #Create the datetime object
-        parsed_timestamp = float(calendar.timegm(date_time_array))
-
-        #Convert the KDM's local time to UTC
-        parsed_timestamp += _parse_time_zone(datetime_str, parsed_timestamp, default_to_local_time)
-
-        if get_timestamp:
-            return int(parsed_timestamp)
-        else:
-            return datetime.datetime.utcfromtimestamp(parsed_timestamp)
-
-    return ValueError
-
-_date_timezone_regex = re.compile(r'(\+|-)(\d\d):?(\d\d)')
-_zulu_time_regex     = re.compile(r'Z')
-def _parse_time_zone(datetime_str, parsed_timestamp, default_to_local_time):
-    """
-    Parses a datetime string and looks for the RFC 3339 specified time offset +\-HH:MM
-    and returns a int that will convert the timestamp to UTC
-    It doesn't look for the possible Z (zulu) case because zulu==UTC and a failed search results in 0 being returned
-    """
-
-    tz_search = _date_timezone_regex.search(datetime_str)
-    if tz_search:
-        utc_offset_direction = tz_search.group(1)
-        utc_offset_hours = int(utc_offset_direction + tz_search.group(2))
-        utc_offset_mins = int(utc_offset_direction + tz_search.group(3))
-        #Multiply the result by -1 because +05:00 means the UTC time will be 5 hours less than local time
-        return (60*60*utc_offset_hours + 60*utc_offset_mins) * -1
-    elif _zulu_time_regex.match(datetime_str) or not default_to_local_time:
-        return 0
-    else:
-        if time.localtime(parsed_timestamp).tm_isdst and time.daylight:
-            return time.altzone
-        else:
-            return time.timezone
-
-def title_and_KDM_title_are_similar(title_in_JSON,title_in_KDM):
+def check_similarity(title_in_JSON,title_in_KDM):
     common_words = ['-', 'DI', 'A', 'DA', 'IN', 'CON', 'SU', 'PER', 'TRA', 'FRA', 'IL', 'LO', 'LA', 'I', 'GLI', 'LE', 'UN', 'UNO', 'UNA', 'THE']
     # removes non-ASCII char
     title_from_JSON_only_ASCII = title_in_JSON.encode('ascii', 'ignore').upper().decode("utf-8")
@@ -118,7 +42,7 @@ class Application(tk.Frame):
             self.film_JSON_list.append({u'title':u'',u'min_TS':'0',u'max_TS':'0'})
 
         for i in range(3):
-            tk.Button(self, text=self.film_JSON_list[i][u'title'],command=lambda i=i: self.setFilm(i),cursor="hand2").grid(sticky=E+W,column=0,row=i)
+            tk.Button(self, text=self.film_JSON_list[i][u'title'],command=lambda i=i: self.setFilm(i),cursor="hand2").grid(sticky=tk.E+tk.W,column=0,row=i)
 
         self.textbox = tk.Text(self, borderwidth=3, relief="sunken")
         self.textbox.config(font=("consolas", 10), undo=True, wrap='word',state=tk.DISABLED)
@@ -150,22 +74,34 @@ class Application(tk.Frame):
         self.textbox.delete(1.0, tk.END)
         self.textbox.config(state=tk.DISABLED)
 
+    def getElementByName(self,xmldoc,name):
+        return xmldoc.getElementsByTagName(name)[0].childNodes[0].data
+
     def processXML(self,file):
         if file==None or self.selected_film_ID==-1:
             return
 
         self.addText("[Data from Web]\n")
-        self.addText("Selected Film:\t\t"+self.film_JSON_list[self.selected_film_ID][u'title'])
-        self.addText("\nFirst show:\t\t"+str(datetime.datetime.fromtimestamp(int(self.film_JSON_list[self.selected_film_ID][u'min_TS']))))
-        self.addText("\nLast show:\t\t"+str(datetime.datetime.fromtimestamp(int(self.film_JSON_list[self.selected_film_ID][u'max_TS']))))
+        web_title = self.film_JSON_list[self.selected_film_ID][u'title']
+        web_start_TS = int(self.film_JSON_list[self.selected_film_ID][u'min_TS'])
+        web_stop_TS = int(self.film_JSON_list[self.selected_film_ID][u'max_TS'])
+        self.addText("Selected Film:\t\t"+web_title)
+        self.addText("\nFirst show:\t\t"+str(datetime.datetime.fromtimestamp(web_start_TS)))
+        self.addText("\nLast show:\t\t"+str(datetime.datetime.fromtimestamp(web_stop_TS)))
 
         self.addText("\n\n[Data from KDM]\n")
         self.addText("Selected KDM:\t\t"+os.path.basename(file))
 
         xmldoc = minidom.parse(file)
-        self.addText("\nContentTitleText:\t\t"+str(xmldoc.getElementsByTagName('ContentTitleText')[0].childNodes[0].data))
-        self.addText("\nContentKeysNotValidBefore:\t\t\t\t"+str(parse_date(xmldoc.getElementsByTagName('ContentKeysNotValidBefore')[0].childNodes[0].data)))
-        self.addText("\nContentKeysNotValidAfter:\t\t\t\t"+str(parse_date(xmldoc.getElementsByTagName('ContentKeysNotValidAfter')[0].childNodes[0].data)))
+        KDM_start_datetime = dateutil.parser.parse(self.getElementByName(xmldoc,'ContentKeysNotValidBefore')).astimezone(dateutil.tz.gettz('UTC')).replace(tzinfo=None)
+        KDM_stop_datetime = dateutil.parser.parse(self.getElementByName(xmldoc,'ContentKeysNotValidAfter')).astimezone(dateutil.tz.gettz('UTC')).replace(tzinfo=None)
+        KDM_title = self.getElementByName(xmldoc,'ContentTitleText')
+        self.addText("\nContentTitleText:\t\t"+KDM_title)
+        self.addText("\nContentKeysNotValidBefore:\t\t\t\t"+str(KDM_start_datetime))
+        self.addText("\nContentKeysNotValidAfter:\t\t\t\t"+str(KDM_stop_datetime))
+
+        KDM_start_TS = (KDM_start_datetime - datetime.datetime(1970,1,1)).total_seconds()
+        KDM_stop_TS = (KDM_stop_datetime - datetime.datetime(1970,1,1)).total_seconds()
         
         self.addText("\n\n'"+SERIAL+"' found in KDM:\t\t\t\t")
         if SERIAL not in open(file).read():
@@ -174,15 +110,13 @@ class Application(tk.Frame):
             self.addText("OK")
 
         self.addText("\nValid KDM interval:\t\t\t\t")
-        KDM_start_TS = parse_date(xmldoc.getElementsByTagName('ContentKeysNotValidBefore')[0].childNodes[0].data,get_timestamp=True)
-        KDM_stop_TS = parse_date(xmldoc.getElementsByTagName('ContentKeysNotValidAfter')[0].childNodes[0].data,get_timestamp=True)
-        if int(self.film_JSON_list[self.selected_film_ID][u'min_TS'])>KDM_start_TS and int(self.film_JSON_list[self.selected_film_ID][u'max_TS'])<KDM_stop_TS:
+        if web_start_TS>KDM_start_TS and web_stop_TS<KDM_stop_TS:
             self.addText("OK")
         else:
             self.addText("KO")
 
         self.addText("\nTitle ?= ContentTitleText:\t\t\t\t")
-        (similar,match) = title_and_KDM_title_are_similar(self.film_JSON_list[self.selected_film_ID][u'title'],str(xmldoc.getElementsByTagName('ContentTitleText')[0].childNodes[0].data))
+        (similar,match) = check_similarity(web_title,KDM_title)
         if similar:
             self.addText("OK ('"+match+"' matches ContentTitleText)")
         else:
@@ -198,13 +132,7 @@ class Application(tk.Frame):
         self.highlight_pattern(self.textbox,"[Data from Web]", "blue")
         self.highlight_pattern(self.textbox,"[Data from KDM]", "blue")
 
-    def highlight_pattern(self, txt, pattern, tag, start="1.0", end="end",regexp=False):
-        '''Apply the given tag to all text that matches the given pattern
-
-        If 'regexp' is set to True, pattern will be treated as a regular
-        expression.
-        '''
-
+    def highlight_pattern(self, txt, pattern, tag, start="1.0", end="end"):
         start = txt.index(start)
         end = txt.index(end)
         txt.mark_set("matchStart", start)
@@ -214,7 +142,7 @@ class Application(tk.Frame):
         count = tk.IntVar()
         while True:
             index = txt.search(pattern, "matchEnd","searchLimit",
-                                count=count, regexp=regexp)
+                                count=count, regexp=False)
             if index == "": break
             txt.mark_set("matchStart", index)
             txt.mark_set("matchEnd", "%s+%sc" % (index, count.get()))
